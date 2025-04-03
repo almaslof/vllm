@@ -4,6 +4,8 @@
 import math
 from typing import List, Optional, Tuple, Union
 
+from vllm.attention import Attention
+from transformers import GenerationConfig, GenerationMixin
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from typing import Any, Dict, Iterable, Optional, Set, Tuple, Type, Union
@@ -22,6 +24,10 @@ from vllm.config import VllmConfig
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
 )
+
+from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
+                                               QKVParallelLinear,
+                                               RowParallelLinear)
 
 class PhariaRotaryEmbedding(nn.Module):
     def __init__(
@@ -163,10 +169,14 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: PhariaConfig, prefix: str = "", layer_idx: Optional[int] = None):
+    def __init__(self, 
+                 config: PhariaConfig, 
+                 prefix: str = "", 
+                 layer_idx: Optional[int] = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self.prefix = prefix
         # if layer_idx is None:
         #     logger.warning_once(
         #         f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
@@ -184,28 +194,63 @@ class LlamaAttention(nn.Module):
         self.rope_theta = config.rope_theta
         self.is_causal = True
 
+        TP_SIZE = 1
+        self.scaling = self.head_dim**-0.5
+        self.num_kv_heads = max(1, self.num_key_value_heads // TP_SIZE)
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_key_value_heads * self.head_dim
+
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
 
-        self.q_proj = nn.Linear(
-            self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias
+        #self.q_proj = nn.Linear(
+        #    self.hidden_size, 
+        #    self.num_heads * self.head_dim, 
+        #    bias=config.attention_bias
+        #)
+        #self.k_proj = nn.Linear(
+        #    self.hidden_size,
+        #    self.num_key_value_heads * self.head_dim,
+        #    bias=config.attention_bias,
+        #)
+        #self.v_proj = nn.Linear(
+        #    self.hidden_size,
+        #    self.num_key_value_heads * self.head_dim,
+        #    bias=config.attention_bias,
+        #)
+        #self.o_proj = nn.Linear(
+        #    self.hidden_size, self.hidden_size, bias=config.attention_bias
+        #)
+
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=self.hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=self.num_heads,
+            total_num_kv_heads=self.num_key_value_heads,
+            prefix=f"{self.prefix}.qkv_proj",
         )
-        self.k_proj = nn.Linear(
-            self.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=config.attention_bias,
+
+        self.o_proj = RowParallelLinear(
+            input_size=self.num_heads * self.head_dim,
+            output_size=self.hidden_size,
+            bias=self.config.attention_bias,
+            prefix=f"{self.prefix}.o_proj",
         )
-        self.v_proj = nn.Linear(
-            self.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=config.attention_bias,
+
+        self.attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            cache_config=None,
+            quant_config=None,
+            per_layer_sliding_window=None,
+            prefix=f"{self.prefix}.vllm_attn",
         )
-        self.o_proj = nn.Linear(
-            self.hidden_size, self.hidden_size, bias=config.attention_bias
-        )
+
         self._init_rope()
 
     def _init_rope(self):
@@ -245,22 +290,22 @@ class LlamaAttention(nn.Module):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len = hidden_states.size()
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        #bsz, q_len = hidden_states.size()
+        #query_states = self.q_proj(hidden_states)
+        #key_states = self.k_proj(hidden_states)
+        #value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(
-            bsz, q_len, self.num_heads, self.head_dim
-        ).transpose(1, 2)
-        key_states = key_states.view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
-        ).transpose(1, 2)
-        value_states = value_states.view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
-        ).transpose(1, 2)
+        #key_states = key_states.view(5, 512, 1, 1).transpose(1, 2)
+        #value_states = value_states.view(bsz, 512, 1, 1).transpose(1, 2)
+        #query_states = query_states.view(bsz, q_len, 1, 1).transpose(1, 2)
+        #key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        #value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
+        qkv, _ = self.qkv_proj(hidden_states)
+        query_states, key_states, value_states = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        import pdb; pdb.set_trace()
         cos, sin = self.rotary_emb(value_states, position_ids)
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin
@@ -335,7 +380,7 @@ class PhariaDecoderLayer(nn.Module):
     def __init__(self, config: PhariaConfig, layer_idx: int, prefix: str = ""):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = LlamaAttention(config=config, prefix=f"{prefix}.decoder", layer_idx=layer_idx)
         self.mlp = PhariaMLP(config, layer_idx=layer_idx)
         self.input_layernorm = nn.LayerNorm(config.hidden_size)
         self.post_attention_layernorm = nn.LayerNorm(config.hidden_size)
@@ -427,7 +472,7 @@ class PhariaModel(PhariaPreTrainedModel):
 
         self.layers = nn.ModuleList(
             [
-                PhariaDecoderLayer(config, layer_idx)
+                PhariaDecoderLayer(config, layer_idx, prefix=f"{layer_idx}")
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -673,7 +718,7 @@ class PhariaModel(PhariaPreTrainedModel):
         return causal_mask
 
 
-class PhariaForCausalLM(PhariaPreTrainedModel):
+class PhariaForCausalLM(PhariaPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, *,  vllm_config: VllmConfig, prefix: str = ""):
@@ -687,7 +732,7 @@ class PhariaForCausalLM(PhariaPreTrainedModel):
         self.post_init()
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+        return self.model.embed_tokens(input_ids)
 
     def set_input_embeddings(self, value):
         self.model.embed_tokens = value

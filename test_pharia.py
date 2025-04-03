@@ -6,9 +6,10 @@ from vllm.model_executor.models.pharia_orig_modified import PhariaForCausalLM
 
 ModelRegistry.register_model("PhariaForCausalLM", PhariaForCausalLM)
 MODEL_NAME = "Aleph-Alpha/Pharia-1-LLM-7B-control-hf"
+MODEL_NAME = "/Users/al314/projects/amd/aleph-alpha/Pharia-1-LLM-7B-control-hf"
 llm = LLM(model=MODEL_NAME, trust_remote_code=True, dtype="float16")
-#print(llm.generate(["How old are you?"]))
-print(llm.generate(["wie heißt du?"])[0].outputs[0].text)
+#llm = LLM(model=MODEL_NAME, dtype="float16")
+print(llm.generate(["How old are you?"]))
 
 
 if 1 == 0:
