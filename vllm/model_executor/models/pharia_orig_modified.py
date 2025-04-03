@@ -163,7 +163,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: PhariaConfig, layer_idx: Optional[int] = None):
+    def __init__(self, config: PhariaConfig, prefix: str = "", layer_idx: Optional[int] = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -245,8 +245,7 @@ class LlamaAttention(nn.Module):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        import pdb; pdb.set_trace()
-        bsz, q_len, _ = hidden_states.size()
+        bsz, q_len = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
@@ -325,25 +324,18 @@ class PhariaMLP(nn.Module):
         self.down_proj = nn.Linear(
             self.intermediate_size, self.hidden_size, bias=config.mlp_bias
         )
-        #self.act_fn = ACT2FN[config.hidden_act]
-        self.act_fn = ACT2FN["silu"]
-        #self.act_fn = nn.SiLU()
+        self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
         o = self.down_proj(self.act_fn(self.up_proj(x)))
         return o
-        #x, _ = self.up_proj(x)
-        #x = self.act_fn(x)
-        #x, _ = self.down_proj(x)
-        #return x
 
 
 class PhariaDecoderLayer(nn.Module):
-    def __init__(self, config: PhariaConfig, layer_idx: int):
+    def __init__(self, config: PhariaConfig, layer_idx: int, prefix: str = ""):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
-        config.hidden_act = "silu"
         self.mlp = PhariaMLP(config, layer_idx=layer_idx)
         self.input_layernorm = nn.LayerNorm(config.hidden_size)
         self.post_attention_layernorm = nn.LayerNorm(config.hidden_size)
@@ -398,7 +390,6 @@ class PhariaDecoderLayer(nn.Module):
         return outputs
 
 
-# GenerationMixin
 class PhariaPreTrainedModel(PreTrainedModel):
     config_class = PhariaConfig
     base_model_prefix = "model"
@@ -425,7 +416,7 @@ class PhariaPreTrainedModel(PreTrainedModel):
 class PhariaModel(PhariaPreTrainedModel):
     config_class = PhariaConfig
 
-    def __init__(self, config: PhariaConfig):
+    def __init__(self, config: PhariaConfig, prefix: str = ""):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -444,7 +435,7 @@ class PhariaModel(PhariaPreTrainedModel):
 
     def get_input_embeddings(self, input_ids: torch.Tensor):
         return self.embed_tokens(input_ids)
-    # position
+    
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -485,7 +476,7 @@ class PhariaModel(PhariaPreTrainedModel):
         #     use_cache = False
 
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            inputs_embeds = self.get_input_embeddings(input_ids)
 
         return_legacy_cache = False
         if use_cache and not isinstance(
@@ -682,24 +673,21 @@ class PhariaModel(PhariaPreTrainedModel):
         return causal_mask
 
 
-
 class PhariaForCausalLM(PhariaPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, *,  vllm_config: VllmConfig, prefix: str = ""):
         config = vllm_config.model_config.hf_config
         super().__init__(config)
-        self.config = config
-
-        self.model = PhariaModel(config)
+        self.model = PhariaModel(config, prefix=prefix)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
 
-    def get_input_embeddings(self):
-        return self.model.embed_tokens
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
 
     def set_input_embeddings(self, value):
         self.model.embed_tokens = value
@@ -716,22 +704,15 @@ class PhariaForCausalLM(PhariaPreTrainedModel):
     def get_decoder(self):
         return self.model
 
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[torch.Tensor]:
-        logits = self.logits_processor(self.lm_head, hidden_states,
-                                       sampling_metadata)
+    def compute_logits( self, hidden_states: torch.Tensor, sampling_metadata: SamplingMetadata,) -> Optional[torch.Tensor]:
+        logits = self.logits_processor(self.lm_head, hidden_states, sampling_metadata)
         return logits
 
-    def sample(self, logits: torch.Tensor,
-               sampling_metadata: SamplingMetadata) -> Optional[SamplerOutput]:
+    def sample(self, logits: torch.Tensor, sampling_metadata: SamplingMetadata) -> Optional[SamplerOutput]:
         next_tokens = self.sampler(logits, sampling_metadata)
         return next_tokens
 
-    def load_weights(self, weights: Iterable[Tuple[str,
-                                                   torch.Tensor]]) -> Set[str]:
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head."]
@@ -836,8 +817,6 @@ class PhariaForCausalLM(PhariaPreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-    
-
 
     def prepare_inputs_for_generation(
         self,
