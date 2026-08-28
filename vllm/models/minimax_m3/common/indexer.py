@@ -97,25 +97,6 @@ class MiniMaxM3IndexerBackend(AttentionBackend):
     def is_sparse(cls) -> bool:
         return True
 
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        return (num_blocks, block_size, head_size)
-
-    @staticmethod
-    def get_kv_cache_stride_order(
-        include_num_layers_dimension: bool = False,
-    ) -> tuple[int, ...]:
-        if include_num_layers_dimension:
-            # M3 does not use cross-layer (per-layer-stacked) KV blocks.
-            raise NotImplementedError
-        return (0, 1, 2)
-
 
 class MiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
     """Side KV cache for the indexer's per-token index keys (key-only).
@@ -128,6 +109,7 @@ class MiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         self,
         head_dim: int,
         prefix: str,
+        sparse_block_size: int,
         cache_config: CacheConfig | None = None,
         indexer_kv_dtype: IndexerKVDType = "bf16",
         backend_cls: type[AttentionBackend] = MiniMaxM3IndexerBackend,
@@ -144,6 +126,7 @@ class MiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
             )
         self.kv_cache = torch.tensor([])
         self.head_dim = head_dim
+        self.sparse_block_size = sparse_block_size
         self.indexer_kv_dtype = indexer_kv_dtype
         # Side-cache storage dtype: bf16, or e4m3 for the fp8 score path.
         self.dtype = cache_dtype
@@ -156,10 +139,14 @@ class MiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        # [B, H=1, N, C] -> [B, N, C]
+        self.kv_cache = kv_cache.squeeze(1)
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # Key-only: MLAAttentionSpec budgets one vector/token (not 2x for K+V).
         return MLAAttentionSpec(
-            block_size=vllm_config.cache_config.block_size,
+            block_size=self.sparse_block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
@@ -388,6 +375,7 @@ class MiniMaxM3IndexerImpl(nn.Module):
         self.index_cache = MiniMaxM3IndexerCache(
             head_dim=index_head_dim,
             prefix=f"{prefix}.index_cache",
+            sparse_block_size=sparse_block_size,
             cache_config=cache_config,
             indexer_kv_dtype=indexer_kv_dtype,
             backend_cls=type(self).indexer_backend_cls,

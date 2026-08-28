@@ -14,6 +14,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
+from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import is_quantized_kv_cache
@@ -31,7 +32,7 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_prefills_and_extends,
 )
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
 
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
@@ -368,6 +369,7 @@ class AiterFlashAttentionMetadata:
     #                                   |-- query_len ---|
 
     num_actual_tokens: int  # Number of tokens excluding padding.
+    max_query_len: int
     query_start_loc: torch.Tensor
     max_seq_len: int
     seq_lens: torch.Tensor
@@ -464,6 +466,36 @@ class AiterFlashAttentionMetadataBuilder(
         fast_build: bool = False,
     ) -> "AiterFlashAttentionMetadata":
         assert self.reorder_batch_threshold is not None
+
+        # Fast build for the unified path: skip expensive split/extend metadata
+        # when we know forward() will take the unified_attention fast path.
+        if (
+            not rocm_aiter_ops.is_shuffle_kv_cache_enabled()
+            and self.aot_sliding_window is None
+            and common_prefix_len == 0
+        ):
+            return AiterFlashAttentionMetadata(
+                num_actual_tokens=common_attn_metadata.num_actual_tokens,
+                max_query_len=common_attn_metadata.max_query_len,
+                query_start_loc=common_attn_metadata.query_start_loc,
+                max_seq_len=common_attn_metadata.max_seq_len,
+                seq_lens=common_attn_metadata.seq_lens,
+                block_table=common_attn_metadata.block_table_tensor,
+                causal=common_attn_metadata.causal,
+                slot_mapping=common_attn_metadata.slot_mapping,
+                num_decodes=common_attn_metadata.num_reqs,
+                num_decode_tokens=common_attn_metadata.num_actual_tokens,
+                num_prefills=0,
+                num_extends=0,
+                num_extend_tokens=0,
+                decode_metadata=None,
+                prefill_metadata=None,
+                extend_metadata=None,
+                use_cascade=False,
+                k_scale=self.scale,
+                v_scale=self.scale,
+            )
+
         split_ret = split_decodes_prefills_and_extends(
             common_attn_metadata,
             decode_threshold=self.reorder_batch_threshold,
@@ -496,13 +528,14 @@ class AiterFlashAttentionMetadataBuilder(
 
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
 
-        # Only copy seq_lens to CPU when prefill or extend is present to avoid a
-        # blocking device→host transfer.
-        seq_lens = (
-            common_attn_metadata.seq_lens.cpu()
-            if num_prefills > 0 or num_extends > 0
-            else None
-        )
+        with gpu_sync_allowed():
+            # Only copy seq_lens to CPU when prefill or extend is present to avoid a
+            # blocking device→host transfer.
+            seq_lens = (
+                common_attn_metadata.seq_lens.cpu()
+                if num_prefills > 0 or num_extends > 0
+                else None
+            )
 
         query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
 
@@ -646,6 +679,7 @@ class AiterFlashAttentionMetadataBuilder(
 
         attn_metadata = AiterFlashAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
+            max_query_len=common_attn_metadata.max_query_len,
             query_start_loc=common_attn_metadata.query_start_loc,
             max_seq_len=common_attn_metadata.max_seq_len,
             seq_lens=common_attn_metadata.seq_lens,
@@ -687,6 +721,7 @@ class AiterFlashAttentionMetadataBuilder(
 
         return AiterFlashAttentionMetadata(
             num_actual_tokens=num_tokens,
+            max_query_len=common_attn_metadata.max_query_len,
             query_start_loc=common_attn_metadata.query_start_loc,
             max_seq_len=common_attn_metadata.max_seq_len,
             seq_lens=common_attn_metadata.seq_lens,
@@ -737,7 +772,7 @@ class AiterFlashAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [16, 32]
+        return [MultipleOf(16)]
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -761,18 +796,22 @@ class AiterFlashAttentionBackend(AttentionBackend):
     def get_builder_cls() -> type["AiterFlashAttentionMetadataBuilder"]:
         return AiterFlashAttentionMetadataBuilder
 
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        if block_size % 16 != 0:
+    @classmethod
+    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
+        """Validate the block size the ROCm gather kernels require."""
+        # block_size == 1 is the per-token page-size probe (see
+        # Platform.get_page_size_bytes); real blocks must be gatherable in
+        # 16-token units by the ROCm kernel.
+        if spec.block_size != 1 and spec.block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
-        # K and V are packed into the content dim: logical (B, H, N, 2*hs).
-        return (num_blocks, num_kv_heads, block_size, 2 * head_size)
+        return spec
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        # K and V come out of the content dim as transposed views rather than
+        # copies, so the head dim may sit on either side of the block dim, but
+        # the layer must stay outermost.
+        return (KVCacheLayout.LBHNC, KVCacheLayout.LHBNC)
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
@@ -824,6 +863,13 @@ class AiterFlashAttentionImpl(AttentionImpl):
 
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
+
+        self._use_unified_fast_path = (
+            not rocm_aiter_ops.is_shuffle_kv_cache_enabled()
+            and self.sliding_window[0] == -1
+            and self.sinks is None
+        )
+        self._unified_attention_fn = None
 
         if attn_type != AttentionType.DECODER:
             raise NotImplementedError(
@@ -1065,29 +1111,61 @@ class AiterFlashAttentionImpl(AttentionImpl):
         # Whenever making a change in this method, please benchmark the
         # performance to make sure it does not introduce any overhead.
         num_actual_tokens = attn_metadata.num_actual_tokens
-        # (B, H, N, 2*hs) -> ((B, N, H, hs), (B, N, H, hs))
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
 
+        key_cache, value_cache = self._split_kv_cache(kv_cache)
         if is_quantized_kv_cache(self.kv_cache_dtype):
             key_cache = key_cache.view(current_platform.fp8_dtype())
             value_cache = value_cache.view(current_platform.fp8_dtype())
 
-        # decode:extend:prefill
         query = query[:num_actual_tokens]
-        if key is not None:
-            key = key[:num_actual_tokens]
-        if value is not None:
-            value = value[:num_actual_tokens]
-
         output_actual_tokens = output[:num_actual_tokens]
 
-        num_decodes = attn_metadata.num_decodes
-        num_prefills = attn_metadata.num_prefills
-        num_extends = attn_metadata.num_extends
-
-        num_decode_tokens = attn_metadata.num_decode_tokens
-        num_extend_tokens = attn_metadata.num_extend_tokens
         if not attn_metadata.use_cascade:
+            # Fast unified path: process ALL tokens (decode + extend +
+            # prefill) in a single unified_attention call when possible.
+            if self._use_unified_fast_path and attn_metadata.causal:
+                if self._unified_attention_fn is None:
+                    from vllm.v1.attention.ops.triton_unified_attention import (
+                        unified_attention,
+                    )
+                    self._unified_attention_fn = unified_attention
+
+                descale_shape = (
+                    attn_metadata.query_start_loc.shape[0] - 1,
+                    key_cache.shape[2],
+                )
+                self._unified_attention_fn(
+                    q=query,
+                    k=key_cache,
+                    v=value_cache,
+                    out=output_actual_tokens,
+                    cu_seqlens_q=attn_metadata.query_start_loc,
+                    max_seqlen_q=attn_metadata.max_query_len,
+                    seqused_k=attn_metadata.seq_lens,
+                    max_seqlen_k=attn_metadata.max_seq_len,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=self.sliding_window,
+                    block_table=attn_metadata.block_table,
+                    softcap=self.logits_soft_cap,
+                    q_descale=None,
+                    k_descale=layer._k_scale.expand(descale_shape),
+                    v_descale=layer._v_scale.expand(descale_shape),
+                )
+                return output
+
+            # Fallback path: slice key/value and compute split counts.
+            if key is not None:
+                key = key[:num_actual_tokens]
+            if value is not None:
+                value = value[:num_actual_tokens]
+            num_decodes = attn_metadata.num_decodes
+            num_prefills = attn_metadata.num_prefills
+            num_extends = attn_metadata.num_extends
+            num_decode_tokens = attn_metadata.num_decode_tokens
+            num_extend_tokens = attn_metadata.num_extend_tokens
+
             # calculate for pure prefills
             if num_prefills > 0:
                 assert attn_metadata.prefill_metadata is not None
@@ -1129,27 +1207,64 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 if rocm_aiter_ops.is_shuffle_kv_cache_enabled():
                     k_scale = attn_metadata.k_scale
                     v_scale = attn_metadata.v_scale
-                self.extend_forward(
-                    attn_metadata=attn_metadata,
-                    query=extend_queries,
-                    key=extend_keys,
-                    value=extend_values,
-                    key_cache=key_cache,
-                    value_cache=value_cache,
-                    output=extend_outputs,
-                    cu_seqlens_q=attn_metadata.extend_metadata.query_start_loc,
-                    max_seqlen_q=attn_metadata.extend_metadata.max_query_len,
-                    min_seqlen_q=1,
-                    max_seqlen_k=attn_metadata.extend_metadata.max_seq_len,
-                    block_table=attn_metadata.block_table[
+
+                if (
+                    not rocm_aiter_ops.is_shuffle_kv_cache_enabled()
+                    and self.sliding_window[0] == -1
+                ):
+                    from aiter.ops.triton.unified_attention import (
+                        unified_attention,
+                    )
+
+                    extend_block_table = attn_metadata.block_table[
                         num_decodes : num_decodes + num_extends
-                    ],
-                    slot_mapping=attn_metadata.slot_mapping[
+                    ]
+                    extend_seq_lens = attn_metadata.seq_lens[
                         num_decodes : num_decodes + num_extends
-                    ],
-                    k_scale=k_scale,
-                    v_scale=v_scale,
-                )
+                    ]
+                    descale_shape = (num_extends, key_cache.shape[2])
+                    unified_attention(
+                        q=extend_queries,
+                        k=key_cache,
+                        v=value_cache,
+                        out=extend_outputs,
+                        cu_seqlens_q=attn_metadata.extend_metadata.query_start_loc,
+                        max_seqlen_q=attn_metadata.extend_metadata.max_query_len,
+                        seqused_k=extend_seq_lens,
+                        max_seqlen_k=attn_metadata.extend_metadata.max_seq_len,
+                        softmax_scale=self.scale,
+                        causal=True,
+                        alibi_slopes=self.alibi_slopes,
+                        window_size=self.sliding_window,
+                        block_table=extend_block_table,
+                        softcap=self.logits_soft_cap,
+                        q_descale=None,
+                        k_descale=k_scale.expand(descale_shape),
+                        v_descale=v_scale.expand(descale_shape),
+                        sinks=self.sinks,
+                    )
+                else:
+                    self.extend_forward(
+                        attn_metadata=attn_metadata,
+                        query=extend_queries,
+                        key=extend_keys,
+                        value=extend_values,
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        output=extend_outputs,
+                        cu_seqlens_q=attn_metadata.extend_metadata.query_start_loc,
+                        max_seqlen_q=attn_metadata.extend_metadata.max_query_len,
+                        min_seqlen_q=1,
+                        max_seqlen_k=attn_metadata.extend_metadata.max_seq_len,
+                        block_table=attn_metadata.block_table[
+                            num_decodes : num_decodes + num_extends
+                        ],
+                        slot_mapping=attn_metadata.slot_mapping[
+                            num_decodes : num_decodes + num_extends
+                        ],
+                        k_scale=k_scale,
+                        v_scale=v_scale,
+                    )
 
             # calculate for decodes
             if num_decodes > 0:
@@ -1164,10 +1279,11 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     or decode_max_query_len > 1
                     or self.sinks is not None
                 ):
-                    assert not rocm_aiter_ops.is_shuffle_kv_cache_enabled(), (
-                        "Shuffle KV cache layout is not supported with sliding "
-                        "window, sinks, or speculative decoding (multi-token decode)."
-                    )
+                    if rocm_aiter_ops.is_shuffle_kv_cache_enabled() and decode_max_query_len <= 1:
+                        raise RuntimeError(
+                            "Shuffle KV cache layout is not supported with sliding "
+                            "window or sinks."
+                        )
                     if not attn_metadata.causal:
                         from aiter.ops.triton.attention.mha_v3 import (
                             flash_attn_with_kvcache,
@@ -1385,6 +1501,12 @@ class AiterFlashAttentionImpl(AttentionImpl):
 
         return output
 
+    def _split_kv_cache(
+        self, kv_cache: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # (B, H, N, 2*hs) -> ((B, N, H, hs), (B, N, H, hs))
+        return kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+
     def do_kv_cache_update(
         self,
         layer: AttentionLayer,
@@ -1393,8 +1515,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ):
-        # (B, H, N, 2*hs) -> ((B, N, H, hs), (B, N, H, hs))
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        key_cache, value_cache = self._split_kv_cache(kv_cache)
 
         # key and value may be None in the case of cross attention. They are
         # calculated once based on the output from the encoder and then cached
@@ -1449,7 +1570,12 @@ class AiterFlashAttentionImpl(AttentionImpl):
         )
 
     def fused_qk_norm_rope_kvcache_supported(self):
-        return rocm_aiter_ops.is_enabled()
+        # Only fuse when shuffle layout is off; the shuffle write path uses a
+        # dedicated cache update, mirroring fused_rope_kvcache_supported.
+        return (
+            rocm_aiter_ops.is_enabled()
+            and not rocm_aiter_ops.is_shuffle_kv_cache_enabled()
+        )
 
     def do_qk_norm_rope_kvcache_update(
         self,
@@ -1466,7 +1592,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
         kv_cache: torch.Tensor,
         layer_slot_mapping: torch.Tensor,
     ):
-        key_cache, value_cache = kv_cache.unbind(1)
+        key_cache, value_cache = self._split_kv_cache(kv_cache)
         rocm_aiter_ops.do_qk_norm_rope_kvcache_update(
             qkv=qkv,
             q_weight=q_weight,
@@ -1502,7 +1628,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
         layer_slot_mapping: torch.Tensor,
     ):
         # (B, H, N, 2*hs) -> ((B, N, H, hs), (B, N, H, hs))
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        key_cache, value_cache = self._split_kv_cache(kv_cache)
         flash_layout = True
 
         is_fp8_kv_cache = is_quantized_kv_cache(self.kv_cache_dtype)
